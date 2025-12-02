@@ -10,27 +10,25 @@ from PIL import Image, ImageTk  # para mostrar o frame no Tkinter
 
 def process_video(video_path, band_top_frac=0.55, band_bottom_frac=0.95,
                   thresh_val=230, min_pixels_text=150, clean_weight=0.75):
-    """
-    Remove legendas de vídeos verticais (9:16) numa faixa ajustável.
-    - Dentro da faixa: detecta texto branco; se achar, faz inpainting só ali.
-    - Se não detectar texto, não mexe no frame (sem faixa fantasma).
-    - Depois mistura inpainting com o original (clean_weight) pra ficar suave.
-    - NÃO mantém áudio.
-    """
-
     if not os.path.exists(video_path):
         raise FileNotFoundError(f"Vídeo não encontrado: {video_path}")
 
-    # Normaliza parâmetros
     band_top_frac = max(0.0, min(1.0, band_top_frac))
     band_bottom_frac = max(0.0, min(1.0, band_bottom_frac))
     if band_bottom_frac <= band_top_frac:
         raise ValueError("O fim da faixa deve ser maior que o início.")
     clean_weight = max(0.0, min(1.0, clean_weight))
 
-    base_dir = os.path.dirname(video_path)
+    # --- NOME DO ARQUIVO E PASTA DE SAÍDA ---
     video_name = os.path.basename(video_path)
     name_no_ext, _ = os.path.splitext(video_name)
+
+    downloads = os.path.join(os.path.expanduser("~"), "Downloads")
+    output_folder = os.path.join(downloads, "legenda_removida")
+    os.makedirs(output_folder, exist_ok=True)
+
+    temp_output = os.path.join(output_folder, f"{name_no_ext}_temp.avi")
+    final_output = os.path.join(output_folder, f"{name_no_ext}_sem_legenda.mp4")
 
     start_time = time.time()
 
@@ -46,30 +44,20 @@ def process_video(video_path, band_top_frac=0.55, band_bottom_frac=0.95,
     print(f"Processando: {video_name}")
     print(f"Frames: {frame_count}, FPS: {fps}, Resolução: {width}x{height}")
 
-    # Saída em MP4 (sem áudio)
-    output_path = os.path.join(base_dir, f"{name_no_ext}_sem_legenda.mp4")
-    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-    writer = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+    fourcc = cv2.VideoWriter_fourcc(*'XVID')
+    writer = cv2.VideoWriter(temp_output, fourcc, fps, (width, height))
 
     if not writer.isOpened():
         vid.release()
-        raise RuntimeError("Não foi possível criar o arquivo de saída MP4. Verifique se o codec 'mp4v'.")
+        raise RuntimeError("Não foi possível criar AVI temporário.")
 
     band_top = int(height * band_top_frac)
     band_bottom = int(height * band_bottom_frac)
-    band_height = band_bottom - band_top
-
-    if band_height <= 0:
-        vid.release()
-        writer.release()
-        raise RuntimeError("Faixa de legenda inválida. Ajuste os sliders de início/fim da faixa.")
-
-    print(f"Faixa da legenda: y={band_top} até y={band_bottom} (altura {band_height}px)")
 
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
 
-    CLEAN_WEIGHT = clean_weight         # quanto do inpainting
-    ORIG_WEIGHT  = 1.0 - CLEAN_WEIGHT   # quanto do frame original
+    CLEAN_WEIGHT = clean_weight
+    ORIG_WEIGHT  = 1.0 - CLEAN_WEIGHT
 
     frame_idx = 0
 
@@ -78,13 +66,9 @@ def process_video(video_path, band_top_frac=0.55, band_bottom_frac=0.95,
         if not ret:
             break
 
-        # recorta faixa inferior (ROI)
         roi = frame[band_top:band_bottom, :]
-        roi_h, roi_w = roi.shape[:2]
-
         gray_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
 
-        # detecção de texto branco na faixa
         _, bin_roi = cv2.threshold(gray_roi, thresh_val, 255, cv2.THRESH_BINARY)
         bin_roi = cv2.morphologyEx(bin_roi, cv2.MORPH_CLOSE, kernel)
         bin_roi = cv2.dilate(bin_roi, kernel, iterations=1)
@@ -92,19 +76,10 @@ def process_video(video_path, band_top_frac=0.55, band_bottom_frac=0.95,
         white_pixels = cv2.countNonZero(bin_roi)
 
         if white_pixels > min_pixels_text:
-            # há texto suficiente → cria máscara onde tem texto
-            mask_band = bin_roi.copy()
-            mask_band = cv2.GaussianBlur(mask_band, (5, 5), 0)
-
-            # inpainting na ROI
+            mask_band = cv2.GaussianBlur(bin_roi, (5, 5), 0)
             cleaned_roi = cv2.inpaint(roi, mask_band, 3, cv2.INPAINT_TELEA)
-
-            # mistura pra suavizar
             blended_roi = cv2.addWeighted(cleaned_roi, CLEAN_WEIGHT, roi, ORIG_WEIGHT, 0)
-
             frame[band_top:band_bottom, :] = blended_roi
-
-        # se não detectou legenda, não mexe no frame
 
         writer.write(frame)
 
@@ -116,10 +91,24 @@ def process_video(video_path, band_top_frac=0.55, band_bottom_frac=0.95,
     writer.release()
 
     exec_time = time.time() - start_time
-    print(f"Vídeo salvo em: {output_path}")
-    print(f"Tempo de execução: {exec_time:.2f} segundos")
 
-    return output_path, exec_time
+    # ---------- CONVERSÃO PARA H.264 COMPATÍVEL COM CHROME ---------- #
+    print("\nConvertendo para MP4 H.264 (Chrome compatível)...")
+
+    ffmpeg_cmd = (
+        f'ffmpeg -y -i "{temp_output}" '
+        f'-c:v libx264 -pix_fmt yuv420p -preset veryfast '
+        f'"{final_output}"'
+    )
+
+    os.system(ffmpeg_cmd)
+    os.remove(temp_output)
+
+    print(f"\nVídeo final salvo em: {final_output}")
+    print(f"Tempo total: {exec_time:.2f} segundos")
+
+    return final_output, exec_time
+
 
 # ---------- INTERFACE GRÁFICA (TKINTER) ---------- #
 
@@ -128,7 +117,7 @@ preview_frame = None
 preview_img_tk = None
 rect_id = None
 
-MAX_PREVIEW_W = 380   # limites máximos de tamanho da prévia
+MAX_PREVIEW_W = 380
 MAX_PREVIEW_H = 550
 
 def choose_video():
@@ -147,7 +136,6 @@ def choose_video():
     selected_video_path = file_path
     label_video.config(text=f"Vídeo selecionado:\n{file_path}")
 
-    # carrega primeiro frame para preview
     cap = cv2.VideoCapture(file_path)
     ret, frame = cap.read()
     cap.release()
@@ -158,7 +146,6 @@ def choose_video():
 
     preview_frame = frame
 
-    # redimensiona para caber na canvas, preservando proporção
     h, w = frame.shape[:2]
     scale = min(MAX_PREVIEW_W / float(w), MAX_PREVIEW_H / float(h))
     new_w = int(w * scale)
@@ -176,7 +163,6 @@ def choose_video():
     draw_band_rectangle()
 
 def draw_band_rectangle(*args):
-    """Atualiza o retângulo na prévia conforme os sliders de faixa."""
     global rect_id, preview_frame, preview_img_tk
 
     if preview_frame is None or preview_img_tk is None:
@@ -188,7 +174,6 @@ def draw_band_rectangle(*args):
     top_frac = band_top_var.get() / 100.0
     bottom_frac = band_bottom_var.get() / 100.0
 
-    # garante que top < bottom - 2%
     if bottom_frac - top_frac < 0.02:
         bottom_frac = top_frac + 0.02
         band_bottom_var.set(bottom_frac * 100)
@@ -217,7 +202,7 @@ def run_processing():
         messagebox.showerror("Erro", "O fim da faixa deve ser maior que o início.")
         return
 
-    density = density_var.get() / 100.0  # 0–1
+    density = density_var.get() / 100.0
 
     btn_run.config(state="disabled")
     root.update_idletasks()
@@ -225,8 +210,7 @@ def run_processing():
     try:
         messagebox.showinfo(
             "Processando",
-            "Iniciando remoção das legendas...\n"
-            "Dependendo do tamanho do vídeo isso pode demorar alguns minutos."
+            "Iniciando remoção das legendas...\nIsso pode demorar alguns minutos."
         )
         output_path, exec_time = process_video(
             selected_video_path,
@@ -239,13 +223,14 @@ def run_processing():
         messagebox.showinfo(
             "Concluído",
             f"Vídeo processado com sucesso!\n\n"
-            f"Saída (sem áudio): {output_path}\n"
+            f"Saída: {output_path}\n"
             f"Tempo: {exec_time:.2f} s"
         )
     except Exception as e:
         messagebox.showerror("Erro", f"Ocorreu um erro:\n{e}")
     finally:
         btn_run.config(state="normal")
+
 
 # ---------- CRIA JANELA ---------- #
 
@@ -273,17 +258,15 @@ label_video.pack(pady=5)
 frame_middle = tk.Frame(root)
 frame_middle.pack(pady=5, fill="x")
 
-# Canvas de pré-visualização (tamanho será ajustado depois)
 canvas_preview = tk.Canvas(frame_middle, width=MAX_PREVIEW_W, height=MAX_PREVIEW_H, bg="black")
 canvas_preview.pack(side="left", padx=10, pady=5)
 
-# Controles de faixa e densidade
 frame_controls = tk.Frame(frame_middle)
 frame_controls.pack(side="left", padx=20, pady=5, fill="y")
 
-band_top_var = tk.DoubleVar(value=55.0)     # em %
-band_bottom_var = tk.DoubleVar(value=95.0)  # em %
-density_var = tk.DoubleVar(value=75.0)      # densidade da remoção (%)
+band_top_var = tk.DoubleVar(value=55.0)
+band_bottom_var = tk.DoubleVar(value=95.0)
+density_var = tk.DoubleVar(value=75.0)
 
 label_top = tk.Label(frame_controls, text="Início da faixa (%)")
 label_top.pack()
@@ -300,7 +283,6 @@ slider_bottom = tk.Scale(frame_controls, from_=60, to=100,
 slider_bottom.set(95)
 slider_bottom.pack(padx=5, pady=5)
 
-# Slider de densidade (força da remoção)
 label_density = tk.Label(frame_controls, text="Densidade da remoção (%)")
 label_density.pack(pady=(15, 0))
 slider_density = tk.Scale(frame_controls, from_=40, to=100,
@@ -309,9 +291,8 @@ slider_density.pack(padx=5, pady=5)
 
 info_label = tk.Label(
     root,
-    text=("Use os sliders para ajustar visualmente a área onde a legenda será removida\n"
-          "e a densidade da remoção (quanto mais alta, mais forte o apagamento).\n"
-          "A faixa vermelha na prévia mostra a região afetada. O áudio não é preservado."),
+    text=("Ajuste a área da legenda e a densidade do apagamento.\n"
+          "O vídeo final será salvo em MP4 H.264 (compatível com Chrome)."),
     font=("Arial", 9),
     justify="center"
 )
