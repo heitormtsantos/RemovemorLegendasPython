@@ -9,14 +9,22 @@ from PIL import Image, ImageTk  # para mostrar o frame no Tkinter
 # ---------- FUNÇÃO PRINCIPAL DE PROCESSAMENTO ---------- #
 
 def process_video(video_path, band_top_frac=0.55, band_bottom_frac=0.95,
-                  thresh_val=230, min_pixels_text=150, clean_weight=0.75):
+                  band_left_frac=0.0, band_right_frac=1.0,
+                  thresh_val=230, min_pixels_text=150, clean_weight=0.75,
+                  dilation_iter=10, use_edges=False):
     if not os.path.exists(video_path):
         raise FileNotFoundError(f"Vídeo não encontrado: {video_path}")
 
     band_top_frac = max(0.0, min(1.0, band_top_frac))
     band_bottom_frac = max(0.0, min(1.0, band_bottom_frac))
     if band_bottom_frac <= band_top_frac:
-        raise ValueError("O fim da faixa deve ser maior que o início.")
+        raise ValueError("O fim da faixa (Y) deve ser maior que o início.")
+    
+    band_left_frac = max(0.0, min(1.0, band_left_frac))
+    band_right_frac = max(0.0, min(1.0, band_right_frac))
+    if band_right_frac <= band_left_frac:
+        raise ValueError("O fim da faixa (X) deve ser maior que o início.")
+
     clean_weight = max(0.0, min(1.0, clean_weight))
 
     # --- NOME DO ARQUIVO E PASTA DE SAÍDA ---
@@ -53,6 +61,8 @@ def process_video(video_path, band_top_frac=0.55, band_bottom_frac=0.95,
 
     band_top = int(height * band_top_frac)
     band_bottom = int(height * band_bottom_frac)
+    band_left = int(width * band_left_frac)
+    band_right = int(width * band_right_frac)
 
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
 
@@ -66,20 +76,37 @@ def process_video(video_path, band_top_frac=0.55, band_bottom_frac=0.95,
         if not ret:
             break
 
-        roi = frame[band_top:band_bottom, :]
+        roi = frame[band_top:band_bottom, band_left:band_right]
         gray_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
 
         _, bin_roi = cv2.threshold(gray_roi, thresh_val, 255, cv2.THRESH_BINARY)
+        
+        # Se ativado, usa detecção de bordas (Canny) para reforçar a máscara
+        # Isso ajuda a capturar legendas claras ou com bordas definidas que o threshold ignora
+        if use_edges:
+            # Canny com limiares conservadores para pegar texto
+            edges = cv2.Canny(gray_roi, 50, 150)
+            bin_roi = cv2.bitwise_or(bin_roi, edges)
+
         bin_roi = cv2.morphologyEx(bin_roi, cv2.MORPH_CLOSE, kernel)
-        bin_roi = cv2.dilate(bin_roi, kernel, iterations=1)
+
+        # Dilatação configurável
+        if dilation_iter > 0:
+            bin_roi = cv2.dilate(bin_roi, kernel, iterations=dilation_iter)
 
         white_pixels = cv2.countNonZero(bin_roi)
 
         if white_pixels > min_pixels_text:
-            mask_band = cv2.GaussianBlur(bin_roi, (5, 5), 0)
-            cleaned_roi = cv2.inpaint(roi, mask_band, 3, cv2.INPAINT_TELEA)
-            blended_roi = cv2.addWeighted(cleaned_roi, CLEAN_WEIGHT, roi, ORIG_WEIGHT, 0)
-            frame[band_top:band_bottom, :] = blended_roi
+            # Inpainting direto com a máscara binária dilatada
+            # Voltamos a processar a ROI inteira para evitar artefatos de recorte (faixas)
+            cleaned_roi = cv2.inpaint(roi, bin_roi, 3, cv2.INPAINT_TELEA)
+            
+            # Se a densidade for 100%, não misturamos com o original para evitar fantasmas
+            if CLEAN_WEIGHT >= 1.0:
+                frame[band_top:band_bottom, band_left:band_right] = cleaned_roi
+            else:
+                blended_roi = cv2.addWeighted(cleaned_roi, CLEAN_WEIGHT, roi, ORIG_WEIGHT, 0)
+                frame[band_top:band_bottom, band_left:band_right] = blended_roi
 
         writer.write(frame)
 
@@ -92,12 +119,22 @@ def process_video(video_path, band_top_frac=0.55, band_bottom_frac=0.95,
 
     exec_time = time.time() - start_time
 
-    # ---------- CONVERSÃO PARA H.264 COMPATÍVEL COM CHROME ---------- #
-    print("\nConvertendo para MP4 H.264 (Chrome compatível)...")
+    # ---------- CONVERSÃO PARA H.264 COM ÁUDIO ORIGINAL ---------- #
+    print("\nConvertendo para MP4 H.264 e copiando áudio original...")
 
+    # -i temp_output: vídeo processado (sem áudio)
+    # -i video_path: vídeo original (fonte do áudio)
+    # -c:v libx264: recodifica o vídeo
+    # -c:a copy: copia o áudio original sem reprocessar (rápido e sem perda)
+    # -map 0:v:0: pega o vídeo da primeira entrada (temp_output)
+    # -map 1:a:0: pega o áudio da segunda entrada (video_path)
+    # -shortest: garante que pare quando o menor stream acabar (evita loops)
+    
     ffmpeg_cmd = (
-        f'ffmpeg -y -i "{temp_output}" '
+        f'ffmpeg -y -i "{temp_output}" -i "{video_path}" '
+        f'-map 0:v:0 -map 1:a:0? '  # O '?' evita erro se o vídeo original não tiver áudio
         f'-c:v libx264 -pix_fmt yuv420p -preset veryfast '
+        f'-c:a copy -shortest '
         f'"{final_output}"'
     )
 
@@ -118,7 +155,7 @@ preview_img_tk = None
 rect_id = None
 
 MAX_PREVIEW_W = 380
-MAX_PREVIEW_H = 550
+MAX_PREVIEW_H = 450
 
 def choose_video():
     global selected_video_path, preview_frame, preview_img_tk, rect_id
@@ -173,21 +210,29 @@ def draw_band_rectangle(*args):
 
     top_frac = band_top_var.get() / 100.0
     bottom_frac = band_bottom_var.get() / 100.0
+    left_frac = band_left_var.get() / 100.0
+    right_frac = band_right_var.get() / 100.0
 
     if bottom_frac - top_frac < 0.02:
         bottom_frac = top_frac + 0.02
         band_bottom_var.set(bottom_frac * 100)
 
+    if right_frac - left_frac < 0.02:
+        right_frac = left_frac + 0.02
+        band_right_var.set(right_frac * 100)
+
     y1 = int(canvas_h * top_frac)
     y2 = int(canvas_h * bottom_frac)
+    x1 = int(canvas_w * left_frac)
+    x2 = int(canvas_w * right_frac)
 
     if rect_id is None:
         rect_id = canvas_preview.create_rectangle(
-            0, y1, canvas_w, y2,
+            x1, y1, x2, y2,
             outline="red", width=2
         )
     else:
-        canvas_preview.coords(rect_id, 0, y1, canvas_w, y2)
+        canvas_preview.coords(rect_id, x1, y1, x2, y2)
 
 def run_processing():
     global selected_video_path
@@ -197,9 +242,19 @@ def run_processing():
 
     top_frac = band_top_var.get() / 100.0
     bottom_frac = band_bottom_var.get() / 100.0
+    left_frac = band_left_var.get() / 100.0
+    right_frac = band_right_var.get() / 100.0
+    
+    thresh = int(threshold_var.get())
+    dilation = int(dilation_var.get())
+    use_canny = edges_var.get()
 
     if bottom_frac <= top_frac:
-        messagebox.showerror("Erro", "O fim da faixa deve ser maior que o início.")
+        messagebox.showerror("Erro", "O fim da faixa (Y) deve ser maior que o início.")
+        return
+    
+    if right_frac <= left_frac:
+        messagebox.showerror("Erro", "O fim da faixa (X) deve ser maior que o início.")
         return
 
     density = density_var.get() / 100.0
@@ -216,9 +271,13 @@ def run_processing():
             selected_video_path,
             band_top_frac=top_frac,
             band_bottom_frac=bottom_frac,
-            thresh_val=230,
+            band_left_frac=left_frac,
+            band_right_frac=right_frac,
+            thresh_val=thresh,
             min_pixels_text=150,
-            clean_weight=density
+            clean_weight=density,
+            dilation_iter=dilation,
+            use_edges=use_canny
         )
         messagebox.showinfo(
             "Concluído",
@@ -237,8 +296,8 @@ def run_processing():
 root = tk.Tk()
 root.title("Removedor de Legendas 9:16 (Inpainting)")
 
-root.geometry("900x600")
-root.resizable(False, False)
+root.geometry("1000x750")
+root.resizable(True, True)
 
 title_label = tk.Label(root, text="Removedor de Legendas 9:16", font=("Arial", 16, "bold"))
 title_label.pack(pady=5)
@@ -266,28 +325,74 @@ frame_controls.pack(side="left", padx=20, pady=5, fill="y")
 
 band_top_var = tk.DoubleVar(value=55.0)
 band_bottom_var = tk.DoubleVar(value=95.0)
+band_left_var = tk.DoubleVar(value=0.0)
+band_right_var = tk.DoubleVar(value=100.0)
+
+threshold_var = tk.DoubleVar(value=230.0)
+dilation_var = tk.DoubleVar(value=10.0)
 density_var = tk.DoubleVar(value=75.0)
+edges_var = tk.BooleanVar(value=False)
 
-label_top = tk.Label(frame_controls, text="Início da faixa (%)")
-label_top.pack()
-slider_top = tk.Scale(frame_controls, from_=40, to=90,
-                      orient="vertical", variable=band_top_var,
+# --- Sliders de Área ---
+label_area = tk.Label(frame_controls, text="Área de Remoção", font=("Arial", 10, "bold"))
+label_area.pack(pady=(0, 5))
+
+frame_sliders_area = tk.Frame(frame_controls)
+frame_sliders_area.pack(fill="x")
+
+# Top
+tk.Label(frame_sliders_area, text="Topo Y%").pack(anchor="w")
+slider_top = tk.Scale(frame_sliders_area, from_=0, to=100,
+                      orient="horizontal", variable=band_top_var,
                       command=draw_band_rectangle)
-slider_top.pack(padx=5, pady=5)
+slider_top.pack(fill="x")
 
-label_bottom = tk.Label(frame_controls, text="Fim da faixa (%)")
-label_bottom.pack()
-slider_bottom = tk.Scale(frame_controls, from_=60, to=100,
-                         orient="vertical", variable=band_bottom_var,
+# Bottom
+tk.Label(frame_sliders_area, text="Base Y%").pack(anchor="w")
+slider_bottom = tk.Scale(frame_sliders_area, from_=0, to=100,
+                         orient="horizontal", variable=band_bottom_var,
                          command=draw_band_rectangle)
-slider_bottom.set(95)
-slider_bottom.pack(padx=5, pady=5)
+slider_bottom.pack(fill="x")
 
-label_density = tk.Label(frame_controls, text="Densidade da remoção (%)")
-label_density.pack(pady=(15, 0))
-slider_density = tk.Scale(frame_controls, from_=40, to=100,
+# Left
+tk.Label(frame_sliders_area, text="Esq X%").pack(anchor="w")
+slider_left = tk.Scale(frame_sliders_area, from_=0, to=100,
+                      orient="horizontal", variable=band_left_var,
+                      command=draw_band_rectangle)
+slider_left.pack(fill="x")
+
+# Right
+tk.Label(frame_sliders_area, text="Dir X%").pack(anchor="w")
+slider_right = tk.Scale(frame_sliders_area, from_=0, to=100,
+                         orient="horizontal", variable=band_right_var,
+                         command=draw_band_rectangle)
+slider_right.pack(fill="x")
+
+# --- Sliders de Ajuste ---
+label_adjust = tk.Label(frame_controls, text="Ajustes Finos", font=("Arial", 10, "bold"))
+label_adjust.pack(pady=(15, 5))
+
+# Threshold
+tk.Label(frame_controls, text="Limiar de Brilho (0-255)").pack(anchor="w")
+slider_thresh = tk.Scale(frame_controls, from_=0, to=255,
+                         orient="horizontal", variable=threshold_var)
+slider_thresh.pack(fill="x")
+
+# Dilatação
+tk.Label(frame_controls, text="Espessura Máscara").pack(anchor="w")
+slider_dilation = tk.Scale(frame_controls, from_=0, to=50,
+                           orient="horizontal", variable=dilation_var)
+slider_dilation.pack(fill="x")
+
+# Reforço de Bordas
+check_edges = tk.Checkbutton(frame_controls, text="Reforçar Bordas (Canny)", variable=edges_var)
+check_edges.pack(pady=5, anchor="w")
+
+# Densidade
+tk.Label(frame_controls, text="Opacidade Remoção (%)").pack(anchor="w")
+slider_density = tk.Scale(frame_controls, from_=0, to=100,
                           orient="horizontal", variable=density_var)
-slider_density.pack(padx=5, pady=5)
+slider_density.pack(fill="x")
 
 info_label = tk.Label(
     root,
