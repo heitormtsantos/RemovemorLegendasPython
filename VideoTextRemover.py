@@ -2,8 +2,9 @@ import cv2
 import os
 import numpy as np
 import time
+import threading
 import tkinter as tk
-from tkinter import filedialog, messagebox
+from tkinter import filedialog, messagebox, ttk
 from PIL import Image, ImageTk  # para mostrar o frame no Tkinter
 
 # ---------- FUNÇÃO PRINCIPAL DE PROCESSAMENTO ---------- #
@@ -11,7 +12,7 @@ from PIL import Image, ImageTk  # para mostrar o frame no Tkinter
 def process_video(video_path, band_top_frac=0.55, band_bottom_frac=0.95,
                   band_left_frac=0.0, band_right_frac=1.0,
                   thresh_val=230, min_pixels_text=150, clean_weight=0.75,
-                  dilation_iter=10, use_edges=False):
+                  dilation_iter=10, use_edges=False, progress_callback=None):
     if not os.path.exists(video_path):
         raise FileNotFoundError(f"Vídeo não encontrado: {video_path}")
 
@@ -111,7 +112,9 @@ def process_video(video_path, band_top_frac=0.55, band_bottom_frac=0.95,
         writer.write(frame)
 
         frame_idx += 1
-        if frame_idx % 100 == 0:
+        if frame_idx % 10 == 0 or frame_idx == frame_count:
+            if progress_callback:
+                progress_callback((frame_idx / frame_count) * 100)
             print(f"Processado {frame_idx}/{frame_count} frames...")
 
     vid.release()
@@ -153,12 +156,13 @@ selected_video_path = None
 preview_frame = None
 preview_img_tk = None
 rect_id = None
+preview_cap = None
 
 MAX_PREVIEW_W = 380
 MAX_PREVIEW_H = 450
 
 def choose_video():
-    global selected_video_path, preview_frame, preview_img_tk, rect_id
+    global selected_video_path, preview_frame, preview_img_tk, rect_id, preview_cap
 
     file_path = filedialog.askopenfilename(
         title="Escolher vídeo",
@@ -173,36 +177,36 @@ def choose_video():
     selected_video_path = file_path
     label_video.config(text=f"Vídeo selecionado:\n{file_path}")
 
-    cap = cv2.VideoCapture(file_path)
-    ret, frame = cap.read()
-    cap.release()
-
-    if not ret:
-        messagebox.showerror("Erro", "Não foi possível ler o primeiro frame do vídeo.")
+    if preview_cap is not None:
+        preview_cap.release()
+    
+    preview_cap = cv2.VideoCapture(file_path)
+    if not preview_cap.isOpened():
+        messagebox.showerror("Erro", "Não foi possível abrir o vídeo.")
         return
 
-    preview_frame = frame
+    total_frames = int(preview_cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    slider_seek.config(to=total_frames-1, state="normal")
+    slider_seek.set(0)
+    
+    seek_video(0)
 
-    h, w = frame.shape[:2]
-    scale = min(MAX_PREVIEW_W / float(w), MAX_PREVIEW_H / float(h))
-    new_w = int(w * scale)
-    new_h = int(h * scale)
-
-    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    img_pil = Image.fromarray(rgb).resize((new_w, new_h), Image.LANCZOS)
-    preview_img_tk = ImageTk.PhotoImage(img_pil)
-
-    canvas_preview.config(width=new_w, height=new_h)
-    canvas_preview.delete("all")
-    canvas_preview.create_image(0, 0, anchor="nw", image=preview_img_tk)
-
-    rect_id = None
-    draw_band_rectangle()
+def seek_video(val):
+    global preview_frame
+    if preview_cap is None:
+        return
+    
+    frame_no = int(float(val))
+    preview_cap.set(cv2.CAP_PROP_POS_FRAMES, frame_no)
+    ret, frame = preview_cap.read()
+    if ret:
+        preview_frame = frame
+        draw_band_rectangle()
 
 def draw_band_rectangle(*args):
     global rect_id, preview_frame, preview_img_tk
 
-    if preview_frame is None or preview_img_tk is None:
+    if preview_frame is None:
         return
 
     canvas_w = canvas_preview.winfo_width()
@@ -221,6 +225,69 @@ def draw_band_rectangle(*args):
         right_frac = left_frac + 0.02
         band_right_var.set(right_frac * 100)
 
+    # Verifica se deve mostrar o preview da máscara
+    show_mask = mask_preview_var.get()
+    
+    # Atualiza a imagem mostrada
+    if preview_frame is not None:
+        h, w = preview_frame.shape[:2]
+        canvas_w = canvas_preview.winfo_width()
+        canvas_h = canvas_preview.winfo_height()
+        
+        # Redimensionar para o canvas mantendo aspecto
+        scale = min(MAX_PREVIEW_W / float(w), MAX_PREVIEW_H / float(h))
+        new_w = int(w * scale)
+        new_h = int(h * scale)
+        
+        display_frame = preview_frame.copy()
+        
+        if show_mask:
+            # Calcula a máscara com os parâmetros atuais
+            roi_y1 = int(h * top_frac)
+            roi_y2 = int(h * bottom_frac)
+            roi_x1 = int(w * left_frac)
+            roi_x2 = int(w * right_frac)
+            
+            # Garante limites válidos
+            roi_y1 = max(0, min(roi_y1, h-1))
+            roi_y2 = max(roi_y1+1, min(roi_y2, h))
+            roi_x1 = max(0, min(roi_x1, w-1))
+            roi_x2 = max(roi_x1+1, min(roi_x2, w))
+            
+            roi = display_frame[roi_y1:roi_y2, roi_x1:roi_x2]
+            gray_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+            
+            # Parâmetros
+            thresh_val = int(threshold_var.get())
+            use_edges = edges_var.get()
+            dilation_iter = int(dilation_var.get())
+            
+            _, bin_roi = cv2.threshold(gray_roi, thresh_val, 255, cv2.THRESH_BINARY)
+            
+            if use_edges:
+                edges = cv2.Canny(gray_roi, 50, 150)
+                bin_roi = cv2.bitwise_or(bin_roi, edges)
+            
+            kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+            bin_roi = cv2.morphologyEx(bin_roi, cv2.MORPH_CLOSE, kernel)
+            
+            if dilation_iter > 0:
+                bin_roi = cv2.dilate(bin_roi, kernel, iterations=dilation_iter)
+            
+            # Converte máscara para BGR (verde neon para destaque) onde for branco
+            mask_bgr = cv2.cvtColor(bin_roi, cv2.COLOR_GRAY2BGR)
+            # Pinta de verde onde detectou texto
+            mask_bgr[bin_roi == 255] = [0, 255, 0] 
+            
+            # Sobrepõe na ROI
+            display_frame[roi_y1:roi_y2, roi_x1:roi_x2] = mask_bgr
+
+        # Converte para exibir no Tkinter
+        rgb = cv2.cvtColor(display_frame, cv2.COLOR_BGR2RGB)
+        img_pil = Image.fromarray(rgb).resize((new_w, new_h), Image.LANCZOS)
+        preview_img_tk = ImageTk.PhotoImage(img_pil)
+        canvas_preview.create_image(0, 0, anchor="nw", image=preview_img_tk)
+
     y1 = int(canvas_h * top_frac)
     y2 = int(canvas_h * bottom_frac)
     x1 = int(canvas_w * left_frac)
@@ -233,6 +300,109 @@ def draw_band_rectangle(*args):
         )
     else:
         canvas_preview.coords(rect_id, x1, y1, x2, y2)
+
+def update_progress(val):
+    progress_var.set(val)
+
+def processing_finished(output_path, exec_time, error=None):
+    btn_run.config(state="normal")
+    btn_choose.config(state="normal")
+    progress_var.set(0)
+    
+    # Reabre o preview cap se necessário
+    if selected_video_path:
+        choose_video()
+
+    if error:
+        messagebox.showerror("Erro", f"Ocorreu um erro:\n{error}")
+    else:
+        messagebox.showinfo(
+            "Concluído",
+            f"Vídeo processado com sucesso!\n\n"
+            f"Saída: {output_path}\n"
+            f"Tempo: {exec_time:.2f} s"
+        )
+
+def batch_finished(total, errors):
+    btn_run.config(state="normal")
+    btn_choose.config(state="normal")
+    btn_batch.config(state="normal")
+    progress_var.set(0)
+    
+    if selected_video_path:
+        label_video.config(text=f"Vídeo selecionado:\n{selected_video_path}")
+    else:
+        label_video.config(text="Nenhum vídeo selecionado.")
+
+    if errors:
+        msg = f"Processamento concluído com {len(errors)} erros:\n" + "\n".join(errors[:5])
+        if len(errors) > 5: msg += "\n..."
+        messagebox.showwarning("Concluído com Erros", msg)
+    else:
+        messagebox.showinfo("Concluído", f"Todos os {total} vídeos foram processados com sucesso!")
+
+def run_batch_processing():
+    folder_path = filedialog.askdirectory(title="Escolher Pasta para Processamento em Lote")
+    if not folder_path:
+        return
+
+    # Parâmetros
+    top_frac = band_top_var.get() / 100.0
+    bottom_frac = band_bottom_var.get() / 100.0
+    left_frac = band_left_var.get() / 100.0
+    right_frac = band_right_var.get() / 100.0
+    thresh = int(threshold_var.get())
+    dilation = int(dilation_var.get())
+    use_canny = edges_var.get()
+    density = density_var.get() / 100.0
+
+    video_extensions = {".mp4", ".avi", ".mkv", ".mov"}
+    files = [f for f in os.listdir(folder_path) if os.path.splitext(f)[1].lower() in video_extensions]
+
+    if not files:
+        messagebox.showwarning("Aviso", "Nenhum vídeo encontrado na pasta.")
+        return
+
+    btn_run.config(state="disabled")
+    btn_choose.config(state="disabled")
+    btn_batch.config(state="disabled")
+    
+    # Fecha preview
+    if preview_cap is not None:
+        preview_cap.release()
+
+    def task():
+        errors = []
+        total = len(files)
+        
+        for i, filename in enumerate(files):
+            full_path = os.path.join(folder_path, filename)
+            
+            # Atualiza UI
+            msg = f"Processando {i+1}/{total}: {filename}"
+            root.after(0, lambda m=msg: label_video.config(text=m))
+            
+            try:
+                process_video(
+                    full_path,
+                    band_top_frac=top_frac,
+                    band_bottom_frac=bottom_frac,
+                    band_left_frac=left_frac,
+                    band_right_frac=right_frac,
+                    thresh_val=thresh,
+                    min_pixels_text=150,
+                    clean_weight=density,
+                    dilation_iter=dilation,
+                    use_edges=use_canny,
+                    progress_callback=lambda v: root.after(0, lambda: update_progress(v))
+                )
+            except Exception as e:
+                errors.append(f"{filename}: {e}")
+                print(f"Erro em {filename}: {e}")
+        
+        root.after(0, lambda: batch_finished(total, errors))
+
+    threading.Thread(target=task, daemon=True).start()
 
 def run_processing():
     global selected_video_path
@@ -260,35 +430,32 @@ def run_processing():
     density = density_var.get() / 100.0
 
     btn_run.config(state="disabled")
-    root.update_idletasks()
+    btn_choose.config(state="disabled")
+    
+    # Fecha preview para liberar arquivo
+    if preview_cap is not None:
+        preview_cap.release()
 
-    try:
-        messagebox.showinfo(
-            "Processando",
-            "Iniciando remoção das legendas...\nIsso pode demorar alguns minutos."
-        )
-        output_path, exec_time = process_video(
-            selected_video_path,
-            band_top_frac=top_frac,
-            band_bottom_frac=bottom_frac,
-            band_left_frac=left_frac,
-            band_right_frac=right_frac,
-            thresh_val=thresh,
-            min_pixels_text=150,
-            clean_weight=density,
-            dilation_iter=dilation,
-            use_edges=use_canny
-        )
-        messagebox.showinfo(
-            "Concluído",
-            f"Vídeo processado com sucesso!\n\n"
-            f"Saída: {output_path}\n"
-            f"Tempo: {exec_time:.2f} s"
-        )
-    except Exception as e:
-        messagebox.showerror("Erro", f"Ocorreu um erro:\n{e}")
-    finally:
-        btn_run.config(state="normal")
+    def task():
+        try:
+            output_path, exec_time = process_video(
+                selected_video_path,
+                band_top_frac=top_frac,
+                band_bottom_frac=bottom_frac,
+                band_left_frac=left_frac,
+                band_right_frac=right_frac,
+                thresh_val=thresh,
+                min_pixels_text=150,
+                clean_weight=density,
+                dilation_iter=dilation,
+                use_edges=use_canny,
+                progress_callback=lambda v: root.after(0, lambda: update_progress(v))
+            )
+            root.after(0, lambda: processing_finished(output_path, exec_time))
+        except Exception as e:
+            root.after(0, lambda: processing_finished(None, None, str(e)))
+
+    threading.Thread(target=task, daemon=True).start()
 
 
 # ---------- CRIA JANELA ---------- #
@@ -311,14 +478,23 @@ btn_choose.grid(row=0, column=0, padx=10)
 btn_run = tk.Button(frame_top, text="Remover legenda", command=run_processing, width=20)
 btn_run.grid(row=0, column=1, padx=10)
 
+btn_batch = tk.Button(frame_top, text="Processar Pasta (Batch)", command=run_batch_processing, width=20, bg="#dddddd")
+btn_batch.grid(row=0, column=2, padx=10)
+
 label_video = tk.Label(root, text="Nenhum vídeo selecionado.", wraplength=860, justify="center")
 label_video.pack(pady=5)
 
 frame_middle = tk.Frame(root)
 frame_middle.pack(pady=5, fill="x")
 
-canvas_preview = tk.Canvas(frame_middle, width=MAX_PREVIEW_W, height=MAX_PREVIEW_H, bg="black")
-canvas_preview.pack(side="left", padx=10, pady=5)
+frame_left = tk.Frame(frame_middle)
+frame_left.pack(side="left", padx=10, pady=5)
+
+canvas_preview = tk.Canvas(frame_left, width=MAX_PREVIEW_W, height=MAX_PREVIEW_H, bg="black")
+canvas_preview.pack(side="top")
+
+slider_seek = tk.Scale(frame_left, from_=0, to=100, orient="horizontal", command=seek_video, state="disabled", label="Navegar no Vídeo")
+slider_seek.pack(fill="x", pady=5)
 
 frame_controls = tk.Frame(frame_middle)
 frame_controls.pack(side="left", padx=20, pady=5, fill="y")
@@ -332,6 +508,7 @@ threshold_var = tk.DoubleVar(value=230.0)
 dilation_var = tk.DoubleVar(value=10.0)
 density_var = tk.DoubleVar(value=75.0)
 edges_var = tk.BooleanVar(value=False)
+mask_preview_var = tk.BooleanVar(value=False)
 
 # --- Sliders de Área ---
 label_area = tk.Label(frame_controls, text="Área de Remoção", font=("Arial", 10, "bold"))
@@ -375,18 +552,26 @@ label_adjust.pack(pady=(15, 5))
 # Threshold
 tk.Label(frame_controls, text="Limiar de Brilho (0-255)").pack(anchor="w")
 slider_thresh = tk.Scale(frame_controls, from_=0, to=255,
-                         orient="horizontal", variable=threshold_var)
+                         orient="horizontal", variable=threshold_var,
+                         command=draw_band_rectangle)
 slider_thresh.pack(fill="x")
 
 # Dilatação
 tk.Label(frame_controls, text="Espessura Máscara").pack(anchor="w")
 slider_dilation = tk.Scale(frame_controls, from_=0, to=50,
-                           orient="horizontal", variable=dilation_var)
+                           orient="horizontal", variable=dilation_var,
+                           command=draw_band_rectangle)
 slider_dilation.pack(fill="x")
 
 # Reforço de Bordas
-check_edges = tk.Checkbutton(frame_controls, text="Reforçar Bordas (Canny)", variable=edges_var)
+check_edges = tk.Checkbutton(frame_controls, text="Reforçar Bordas (Canny)", variable=edges_var,
+                             command=draw_band_rectangle)
 check_edges.pack(pady=5, anchor="w")
+
+# Preview de Máscara (NOVO)
+check_mask = tk.Checkbutton(frame_controls, text="VER O QUE SERÁ APAGADO (Verde)", variable=mask_preview_var,
+                            command=draw_band_rectangle, fg="green", font=("Arial", 9, "bold"))
+check_mask.pack(pady=5, anchor="w")
 
 # Densidade
 tk.Label(frame_controls, text="Opacidade Remoção (%)").pack(anchor="w")
@@ -402,5 +587,16 @@ info_label = tk.Label(
     justify="center"
 )
 info_label.pack(pady=5)
+
+# --- Barra de Progresso ---
+progress_var = tk.DoubleVar()
+frame_bottom = tk.Frame(root)
+frame_bottom.pack(side="bottom", fill="x", padx=10, pady=10)
+
+lbl_progress = tk.Label(frame_bottom, text="Progresso:")
+lbl_progress.pack(side="left")
+
+progress_bar = ttk.Progressbar(frame_bottom, variable=progress_var, maximum=100)
+progress_bar.pack(side="left", fill="x", expand=True, padx=10)
 
 root.mainloop()
